@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tests and coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Local data: keep documentation and directory markers only
+data/raw/**
+data/interim/**
+data/processed/**
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+!data/README.md
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
