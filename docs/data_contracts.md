@@ -1,73 +1,108 @@
-# Data Contracts
+# KOSPI 200 Option Data Contract
 
-This document defines how option-chain data is acquired, stored, normalized,
-and filtered. Provider-specific adapters may differ, but normalized outputs
-must follow this contract.
+This document defines the minimum contract for turning one fixed KOSPI 200
+option-chain snapshot into model-ready inputs. It covers the Stage 1 path:
 
-## 1. Storage layers
+```text
+raw -> normalized -> validated -> model-ready
+```
+
+Provider-specific column names remain provisional until the first real snapshot
+is audited. Unknown values must be recorded as `TBD` or rejected; they must not
+be guessed.
+
+## 1. Storage and immutability
 
 ### `data/raw/`
 
-- Immutable snapshots exactly as downloaded or exported.
-- Never overwrite a raw file in place.
-- Preserve provider field names and metadata where practical.
-- File names should include underlying, quote date/time, and source identifier.
+- Store the source snapshot exactly as downloaded or exported.
+- Never overwrite or edit a raw file in place.
+- Keep market downloads uncommitted unless redistribution is permitted.
+- Record the source filename, file checksum, acquisition time, and provider.
 
 ### `data/interim/`
 
-- Parsed or partially normalized data.
-- May contain provider-specific fields needed for debugging.
+- Store normalized rows and rejected rows separately.
+- Preserve the original provider columns needed for audit and debugging.
 
 ### `data/processed/`
 
-- Analysis-ready tables using the normalized schema below.
-- Must be reproducible from raw data and code.
+- Store only reproducible, model-ready tables.
+- Every processed file must be reproducible from a raw snapshot, configuration,
+  and code version.
 
-Large or non-redistributable downloads should remain uncommitted. Tests use
-small synthetic or legally redistributable fixtures.
+## 2. Required snapshot metadata
 
-## 2. Required normalized fields
+Each snapshot must record:
 
-| Field | Type | Meaning |
-|---|---|---|
-| `underlying` | string | Underlying ticker or identifier |
-| `quote_timestamp` | timezone-aware datetime | Time the quote snapshot represents |
-| `expiration` | timezone-aware datetime or documented market date | Contract expiration |
-| `option_type` | categorical/string | `call` or `put` |
-| `strike` | float | Positive strike price |
-| `bid` | float/nullable | Best bid |
-| `ask` | float/nullable | Best ask |
-| `last` | float/nullable | Last traded price |
-| `volume` | integer/nullable | Session volume when supplied |
-| `open_interest` | integer/nullable | Open interest when supplied |
-| `underlying_spot` | float | Spot or documented reference underlying price |
-| `source` | string | Data provider or origin |
-| `contract_id` | string/nullable | Provider contract symbol or stable identifier |
+- `snapshot_id`;
+- provider and acquisition/export method;
+- acquisition time and the quote time represented by the data;
+- original timezone and normalized timezone;
+- market session;
+- underlying reference value and its observation time;
+- contract expiry convention, exercise style, settlement type, multiplier, and
+  currency;
+- source filename and checksum;
+- redistribution or storage restrictions;
+- configuration and Git commit used for transformation.
 
-Optional provider fields may be retained if clearly named and documented.
-Provider-supplied implied volatility must not overwrite project-computed implied
-volatility.
+A missing value may be marked `TBD` during raw inspection. A row cannot become
+model-ready when the missing value materially changes `S`, `K`, `T`, option
+identity, or the pricing convention.
 
-## 3. Time conventions
+## 3. Normalized schema
 
-- Store timestamps as timezone-aware values.
-- Normalize stored instants to UTC when feasible; convert to exchange or local
-  time only for presentation.
-- Preserve the original provider timestamp and timezone metadata when
-  available.
-- Initial time to maturity uses ACT/365F:
+The raw provider field corresponding to each normalized field must be added
+after snapshot inspection.
+
+| Field | Type | Nullable | Source or rule |
+|---|---|---:|---|
+| `underlying` | string | no | Canonical identifier, initially `KOSPI200` |
+| `contract_id` | string | yes | Provider symbol or stable contract identifier |
+| `quote_timestamp` | timezone-aware datetime | no | Provider quote time; normalize to UTC |
+| `expiry_timestamp` | timezone-aware datetime | no* | Provider expiry, or a documented date-only assumption |
+| `option_type` | string | no | Normalize to `call` or `put` |
+| `strike` | float64 | no | Positive index-point strike |
+| `bid` | float64 | yes | Best bid |
+| `ask` | float64 | yes | Best ask |
+| `last` | float64 | yes | Last traded price; never a silent midpoint fallback |
+| `volume` | nullable integer | yes | Session volume when supplied |
+| `open_interest` | nullable integer | yes | Open interest when supplied |
+| `vendor_implied_volatility` | float64 | yes | Provider value, preserved separately |
+| `spot` | float64 | no* | Positive underlying reference for pricing |
+| `spot_timestamp` | timezone-aware datetime | no* | Observation time of `spot` |
+| `futures_price` | float64 | yes | Same-expiry reference when used to infer forward or `q` |
+| `futures_timestamp` | timezone-aware datetime | yes | Observation time of `futures_price` |
+| `risk_free_rate` | float64 | no* | Annual continuously compounded decimal |
+| `source` | string | no | Provider or origin |
+
+`no*` means required for model-ready output, although the normalized audit table
+may retain the row with a rejection reason when the value is unavailable.
+
+Provider-specific columns may be retained if their names and units are clear.
+They must not overwrite normalized or project-derived fields.
+
+## 4. Time and price conventions
+
+- Preserve original timestamp text and timezone metadata when available.
+- Store normalized instants as timezone-aware UTC values.
+- If expiry is supplied as a date only, record the assumed expiry time and
+  timezone. Without that assumption, `T` is not model-ready.
+- Use ACT/365F consistently:
 
 ```text
-T = max(expiration_timestamp - quote_timestamp, 0) / 365 calendar days
+T = max(expiry_timestamp - quote_timestamp, 0) / 365 calendar days
 ```
 
-- If the provider supplies only an expiration date, the assumed expiration
-  time and exchange timezone must be documented.
-- Do not mix calendar-day and trading-day year fractions within one analysis.
+A structurally valid two-sided quote requires finite values satisfying:
 
-## 4. Price normalization
+```text
+0 <= bid <= ask
+not (bid == 0 and ask == 0)
+```
 
-For valid two-sided quotes:
+For such quotes:
 
 ```text
 mid = (bid + ask) / 2
@@ -75,82 +110,100 @@ spread = ask - bid
 relative_spread = spread / mid, when mid > 0
 ```
 
-A quote is not a valid two-sided quote when:
+The initial model-ready policy uses `mid` as `target_price` and requires
+`bid > 0`. Zero-bid rows are preserved but rejected or flagged explicitly.
+`last` may be analyzed separately but must never be substituted silently.
 
-- bid or ask is missing;
-- bid or ask is negative;
-- ask is below bid;
-- both bid and ask are zero;
-- the resulting midpoint is nonpositive.
+## 5. Derived and model-ready fields
 
-Do not replace missing or invalid midpoints with `last` silently. A notebook may
-compare midpoint and last-trade prices, but the selected pricing input must be
-explicit.
+Normalization or validation may derive:
 
-## 5. Derived fields
-
-Processed data should derive fields as needed, including:
-
-- `mid`;
-- `spread` and `relative_spread`;
+- `mid`, `spread`, and `relative_spread`;
 - `T` in years;
-- `moneyness = strike / underlying_spot`;
-- optional `log_moneyness = log(strike / forward_reference)` when the forward
-  convention is defined;
-- intrinsic value;
-- relevant European no-arbitrage lower and upper price bounds;
-- `is_valid_quote`;
-- one or more `filter_reason` values;
-- project-computed `implied_volatility` and solver status.
+- `forward` and `implied_q` when the spot, same-expiry futures, rate, and timing
+  convention are documented;
+- `log_forward_moneyness = log(strike / forward)`;
+- European no-arbitrage lower and upper bounds;
+- `target_price`;
+- `quality_flags`;
+- `rejection_reasons`;
+- project-computed `model_implied_volatility`, solver status, and repricing
+  error.
 
-Derived columns must identify the rate, dividend, spot/forward reference, and
-valuation timestamp used when those choices affect the value.
+The minimum fields passed to a spot-form European pricing model are:
 
-## 6. Filtering principles
+```text
+spot, strike, T, risk_free_rate, dividend_yield,
+option_type, target_price
+```
 
-- Preserve observations before filtering whenever storage size permits.
-- Add flags and reason codes before dropping rows.
-- Keep data-quality filters separate from research filters.
+A documented forward-form convention may replace `spot` and `dividend_yield`.
+The convention must be consistent across pricing, implied-volatility inversion,
+and reporting.
 
-### Data-quality examples
+## 6. Validation and failure policy
 
-- invalid bid/ask pair;
-- nonpositive strike or spot;
-- nonpositive time to maturity for a live-contract analysis;
-- target price outside European no-arbitrage bounds;
-- duplicated contract snapshot.
+Validation is separated into three levels.
 
-### Research-filter examples
+### Dataset-level errors
 
-- maximum relative spread;
-- minimum open interest or volume;
-- moneyness range;
-- selected expirations;
-- exclusion of extremely short maturities.
+Fail the pipeline when the file cannot be parsed, required columns cannot be
+mapped, snapshot metadata is absent, or units cannot be determined.
 
-Research thresholds must be defined in the notebook or configuration that uses
-them; they are not universal financial truths.
+### Row-level rejection
+
+Retain rejected rows and attach one or more stable reason codes, including:
+
+- `MISSING_REQUIRED_FIELD`;
+- `INVALID_TIMESTAMP` or `UNKNOWN_EXPIRY_TIME`;
+- `INVALID_OPTION_TYPE`;
+- `NONPOSITIVE_STRIKE` or `NONPOSITIVE_SPOT`;
+- `MISSING_BID_ASK`, `NEGATIVE_QUOTE`, `CROSSED_QUOTE`, or `ZERO_QUOTE`;
+- `NONPOSITIVE_BID` under the initial model-ready policy;
+- `NONPOSITIVE_TTM`;
+- `DUPLICATE_CONTRACT_QUOTE`;
+- `PRICE_OUTSIDE_ARBITRAGE_BOUNDS`.
+
+No rejected row may disappear without a reason code. A row may have multiple
+reasons.
+
+### Quality and research flags
+
+Wide spread, low volume or open interest, observation-time mismatch, selected
+expiry, and moneyness range are quality or research filters. Their thresholds
+belong in configuration or the analysis notebook, not in this universal
+contract.
+
+Normalization functions must not mutate the raw input DataFrame unless the
+function signature explicitly documents mutation.
 
 ## 7. Provenance and reproducibility
 
-Each raw snapshot or processed dataset should make it possible to recover:
+Accepted and rejected outputs must remain traceable to:
 
-- source/provider;
-- acquisition or export time;
-- quote timestamp represented by the data;
-- underlying spot reference;
-- transformation code version when practical;
-- filters and parameter values used;
-- rate and dividend inputs used for derived financial fields.
+- `snapshot_id`, source file, and checksum;
+- provider and acquisition/export time;
+- quote, spot, and futures observation times;
+- field mapping and transformation configuration;
+- rate, dividend, forward, expiry-time, and day-count assumptions;
+- code commit and dependency version when practical.
 
-Avoid depending on a provider's current live response to reproduce a historical
-figure. Save the permitted source snapshot or a redistributable fixture.
+Historical results must not depend only on a provider's current live response.
+Use a permitted immutable snapshot or a small redistributable fixture.
 
-## 8. Testing rules
+## 8. Required tests
 
-- Unit tests must not call live APIs.
-- Use small synthetic tables covering valid, missing, crossed, zero, and
-  duplicated quotes.
-- Test timezone handling and year-fraction calculation explicitly.
-- Test that raw inputs are not mutated by normalization functions unless the
-  function contract clearly says otherwise.
+Unit tests must not call live APIs. Small synthetic fixtures must cover:
+
+- valid, missing, negative, crossed, zero-bid, and all-zero quotes;
+- duplicate contract quotes;
+- valid and invalid option-type mappings;
+- timezone conversion, date-only expiry, and ACT/365F;
+- nonpositive `spot`, `strike`, and `T`;
+- raw-input immutability;
+- accepted/rejected separation and 100% reason-code accounting.
+
+Provider field names, exact expiry-time handling, contract multiplier,
+settlement details, and redistribution constraints remain provisional until the
+first real KOSPI 200 snapshot audit. Record the accepted provider decision in
+`docs/decisions.md` when those items are fixed.
