@@ -1,0 +1,6 @@
+iniconfig==2.3.0
+-e git+ssh://git@github.com/AustinMichaelKim/Option-Pricing-Volatility.git@e2b6623e4c6887ffbd38be5fbcd09184c348a130#egg=option_pricing_volatility
+packaging==26.2
+pluggy==1.6.0
+Pygments==2.20.0
+pytest==9.1.1
