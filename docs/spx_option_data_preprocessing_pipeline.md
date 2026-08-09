@@ -1,0 +1,750 @@
+# SPX option data preprocessing pipeline
+
+이 문서는
+[`01_02_SPX_option_data_preprocessing.ipynb`](../notebooks/01_option_chain/01_02_SPX_option_data_preprocessing.ipynb)의
+데이터 파이프라인을 처음부터 끝까지 설명한다. 목적은 코드 한 줄씩을 해설하는 것이 아니라,
+데이터가 **어디서 들어오고**, **어떤 상태를 거치며**, **왜 분리되고**, **어디에 저장되는지**를
+하나의 구조로 이해하는 것이다.
+
+관련 구현은 다음 파일에 나뉘어 있다.
+
+- API 수집과 raw cache 관리:
+  [`spx.py`](../src/option_pricing_volatility/market_data/spx.py)
+- 수집 함수의 package export:
+  [`market_data/__init__.py`](../src/option_pricing_volatility/market_data/__init__.py)
+- snapshot별 전처리, 저장, 감사:
+  [`01_02_SPX_option_data_preprocessing.ipynb`](../notebooks/01_option_chain/01_02_SPX_option_data_preprocessing.ipynb)
+- 다운로드 함수의 네트워크 없는 단위 테스트:
+  [`test_market_data_spx.py`](../tests/test_market_data_spx.py)
+
+## 1. 전체 파이프라인 한눈에 보기
+
+```text
+고정 수집 조건
+QUOTE_DATE / TARGET_DTE / STRIKE_LIMIT
+        │
+        ▼
+download_spx_chain(...)
+        │
+        ├─ raw CSV가 존재하고 nonempty ───────────────┐
+        │                                              │
+        └─ raw CSV가 없음                              │
+             │                                         │
+             ▼                                         │
+        MarketData API GET 1회                         │
+             │                                         │
+             ▼                                         │
+        immutable raw CSV 신규 저장                    │
+             │                                         │
+             └─────────────────────────────────────────┘
+                               │
+                               ▼
+                         raw_df: 원본 행
+                               │
+                               ▼
+                 컬럼명 정규화 + 의미 명확화
+                               │
+                               ▼
+                   dtype 변환 + 파생변수 계산
+                               │
+                               ▼
+                행별 validation + 거절 사유 누적
+                               │
+                               ▼
+                  working_df: 전체 정규화 행
+                         ┌─────┴─────┐
+                         ▼           ▼
+                   accepted_df   rejected_df
+                         │           │
+                         ▼           ▼
+                   processed CSV  interim CSV
+                         └─────┬─────┘
+                               ▼
+                      reload + audit assertions
+```
+
+이 구조에서 중요한 경계는 세 가지다.
+
+1. **수집과 전처리는 분리된다.** `download_spx_chain`은 raw snapshot을 확보하는 데까지만
+   책임진다. 금융 파생변수와 행 validation은 노트북이 담당한다.
+2. **raw 데이터는 수정하지 않는다.** 전처리는 항상 `raw_df.copy(deep=True)`에서 시작한다.
+3. **유효성 판단과 분석 범위 판단은 다르다.** 유효한 행이라고 모두 ATM 부근 분석 후보인
+   것은 아니며, `analysis_candidate`는 rejection 조건이 아니다.
+
+## 2. 파이프라인의 네 가지 데이터 상태
+
+파이프라인을 이해할 때는 변수 이름이 나타내는 데이터 상태를 구분하는 것이 가장 중요하다.
+
+| 상태 | 의미 | 행 보존 정책 | 주요 컬럼 형태 |
+|---|---|---|---|
+| `raw_df` | raw CSV 또는 API 응답에서 읽은 vendor 데이터 | 공급된 모든 행 | `optionSymbol`, `underlyingPrice` 등 vendor naming |
+| `working_df` | 정규화·형변환·파생값·거절 사유가 모두 붙은 감사용 전체 데이터 | raw의 모든 행 | `option_symbol`, `spot`, `T`, `rejection_reason` 등 |
+| `accepted_df` | 모든 필수 validation을 통과한 분석 가능 데이터 | 거절 사유가 없는 행 | `rejection_reason`은 제거됨 |
+| `rejected_df` | 하나 이상의 validation을 통과하지 못한 데이터 | 잘못된 행도 삭제하지 않고 보존 | `rejection_reason`을 포함 |
+
+`raw_row_number`는 raw의 원래 행 위치를 기록한다. 따라서 최종적으로 다음 관계를 검증할 수
+있다.
+
+```text
+raw 행 집합 = accepted 행 집합 ∪ rejected 행 집합
+accepted 행 집합 ∩ rejected 행 집합 = ∅
+```
+
+즉, 어떤 raw 행도 이유 없이 사라지지 않는다.
+
+## 3. 1단계: 실행 환경과 고정 수집 조건 설정
+
+노트북의 `setup` 셀은 먼저 Git으로 프로젝트 root를 찾는다.
+
+```python
+PROJECT_ROOT = Path(
+    subprocess.check_output(
+        ["git", "rev-parse", "--show-toplevel"],
+        text=True,
+    ).strip()
+)
+```
+
+이 방식의 목적은 노트북을 어느 하위 디렉터리에서 열더라도 데이터 경로를 프로젝트 root
+기준으로 일관되게 해석하는 것이다. 이후 `PROJECT_ROOT/src`를 import path에 추가하고
+package의 `download_spx_chain`을 import한다. 기존 API 노트북을 `%run`하지 않기 때문에 그
+노트북의 과거 API 요청 셀은 실행되지 않는다.
+
+수집 조건은 다음 세 값으로 고정된다.
+
+```python
+QUOTE_DATE = "2026-07-15"
+TARGET_DTE = 30
+STRIKE_LIMIT = 450
+```
+
+이 값은 다음 MarketData 요청 파라미터로 연결된다.
+
+| 노트북 값 | API 파라미터 | 의미 |
+|---|---|---|
+| `QUOTE_DATE` | `date` | historical snapshot 기준일 |
+| `TARGET_DTE` | `dte` | 기준일에서 약 30일인 단일 만기 선택 |
+| `STRIKE_LIMIT` | `strikeLimit` | API가 반환할 strike 범위 제한 |
+| 고정값 | `am=false` | AM-settled expiration 제외 |
+| 고정값 | `pm=true` | PM-settled expiration 사용 |
+
+여기서 `TARGET_DTE=30`은 요청 조건이다. 실제 분석에서는 API가 반환한 `updated`와
+`expiration` timestamp를 사용하여 `T`를 다시 계산한다. 요청 DTE를 그대로 잔존만기로
+간주하지 않는다.
+
+동일한 `STEM`을 사용하여 세 저장 위치를 만든다.
+
+```text
+data/raw/marketdata_spx/
+    SPX_2026-07-15_dte030_pm_sl450.csv
+
+data/processed/marketdata_spx/
+    SPX_2026-07-15_dte030_pm_sl450_processed.csv
+
+data/interim/marketdata_spx/
+    SPX_2026-07-15_dte030_pm_sl450_rejected.csv
+```
+
+파일명만 보아도 종목, 기준일, 요청 DTE, PM expiration, strike limit을 복원할 수 있다.
+
+## 4. 2단계: raw cache 또는 API에서 데이터 유입
+
+노트북은 `download_spx_chain`을 한 번 호출한다.
+
+```python
+raw_df = download_spx_chain(
+    quote_date=QUOTE_DATE,
+    target_dte=TARGET_DTE,
+    strike_limit=STRIKE_LIMIT,
+    raw_dir=RAW_DIR,
+)
+```
+
+실제 데이터 유입 경로는 raw 파일 상태에 따라 결정된다.
+
+### 4.1 nonempty raw 파일이 이미 있는 경우
+
+함수는 인증 토큰을 확인하기 전에 raw 경로부터 확인한다. 파일이 존재하고 크기가 0보다
+크면 다음 동작만 수행한다.
+
+```python
+pd.read_csv(file_path)
+```
+
+이 경우:
+
+- API 요청은 0회다.
+- 토큰이 없어도 실행할 수 있다.
+- raw 파일은 수정하거나 다시 저장하지 않는다.
+- 반복 실행 결과가 동일한 historical snapshot에 고정된다.
+
+### 4.2 raw 파일이 존재하지만 비어 있는 경우
+
+빈 파일은 정상 cache도 아니고 “파일이 없음”도 아니다. 함수는 API를 호출하거나 빈 파일을
+덮어쓰지 않고 `MarketDataDownloadError`를 발생시킨다.
+
+이 정책은 부분 다운로드나 손상된 파일을 정상 raw처럼 조용히 대체하는 것을 방지한다.
+
+### 4.3 raw 파일이 없는 경우
+
+이 경우에만 함수가 다음 순서로 동작한다.
+
+1. `MARKETDATA_TOKEN` 환경변수 또는 명시적 `api_token`을 확인한다.
+2. 토큰이 없으면 요청을 보내지 않고 blocker 오류를 발생시킨다.
+3. 고정된 파라미터로 `requests.get`을 정확히 한 번 호출한다.
+4. HTTP status가 `200` 또는 `203`인지 확인한다.
+5. JSON object와 MarketData status `s == "ok"`를 확인한다.
+6. list 형태의 response field로 pandas DataFrame을 만든다.
+7. 행이 비어 있지 않은지 확인한다.
+8. 요청 metadata인 `quote_date`와 `requested_dte`를 보완한다.
+9. `mode="x"`로 신규 raw CSV를 저장한다.
+
+자동 retry, 날짜 변경, DTE 변경, `strikeLimit` 축소는 없다. `no_data`, API error, 비정상
+status, 잘못된 JSON, 서로 다른 list 길이, 빈 option 행은 모두 raw를 저장하지 않고 오류로
+종료한다. 인증 토큰이나 vendor 오류문도 출력하지 않는다.
+
+### 4.4 raw가 immutable이어야 하는 이유
+
+raw snapshot은 이후 모든 결과의 출발점이다. raw를 실행할 때마다 수정하거나 다시 받으면
+다음 문제가 생긴다.
+
+- 같은 노트북을 실행해도 결과가 바뀔 수 있다.
+- vendor 응답 변화와 전처리 코드 변화의 영향을 분리할 수 없다.
+- rejected 행이 원래부터 잘못됐는지, 전처리 중 잘못됐는지 감사하기 어렵다.
+- API credit을 반복 소비할 수 있다.
+
+따라서 raw는 “한 번 확보한 외부 사실”이고, processed/interim은 “코드로 다시 만들 수 있는
+파생 결과”로 취급한다.
+
+## 5. 3단계: raw 컬럼명을 정규화하고 의미를 명확히 하기
+
+전처리는 raw를 직접 수정하지 않고 다음과 같이 복사한다.
+
+```python
+working_df = raw_df.copy(deep=True).reset_index(drop=True)
+```
+
+이후 모든 vendor 컬럼명을 `snake_case`로 바꾼다.
+
+| Vendor 컬럼 | 일반 snake_case | 의미 기반 최종 컬럼 |
+|---|---|---|
+| `optionSymbol` | `option_symbol` | `option_symbol` |
+| `underlyingPrice` | `underlying_price` | `spot` |
+| `openInterest` | `open_interest` | `open_interest` |
+| `firstTraded` | `first_traded` | `first_traded` |
+| `bidSize` | `bid_size` | `bid_size` |
+| `side` | `side` | `option_type` |
+| `updated` | `updated` | `quote_timestamp` |
+| `expiration` | `expiration` | `expiry_timestamp` |
+| `iv` | `iv` | `vendor_iv` |
+
+두 단계로 나누는 이유는 다음과 같다.
+
+- `snake_case`는 표기 형식을 통일한다.
+- 의미 기반 rename은 해당 값이 프로젝트에서 무엇을 뜻하는지 명확히 한다.
+
+예를 들어 `updated`는 단순 갱신 숫자가 아니라 이 snapshot에서 quote를 관측한 실제 시각이므로
+`quote_timestamp`가 된다. `iv`는 공급자 값이지 프로젝트가 계산한 IV가 아니므로
+`vendor_iv`로 분리한다.
+
+정규화 결과 두 원본 컬럼이 같은 이름으로 충돌하면 파이프라인은 `ValueError`로 중단한다.
+어느 값을 사용할지 임의로 선택하지 않는다.
+
+## 6. 4단계: 필수 필드와 선택 필드의 dtype 정규화
+
+### 6.1 필수 필드 그룹
+
+행이 accepted 데이터가 되기 위해 필요한 필드는 세 그룹이다.
+
+| 그룹 | 컬럼 | 처리 |
+|---|---|---|
+| 필수 text | `option_symbol`, `option_type` | 공백 제거, 빈 문자열을 결측 처리, option type 소문자화 |
+| 필수 numeric | `strike`, `bid`, `ask`, `spot` | `pd.to_numeric(errors="coerce")` |
+| 필수 timestamp | `quote_timestamp`, `expiry_timestamp` | Unix seconds → UTC-aware datetime |
+
+필수 컬럼 자체가 raw에 없다면 해당 컬럼을 `pd.NA`로 만든다. 따라서 전체 파이프라인이 즉시
+깨지는 대신, 영향을 받는 모든 행에 명시적인 `MISSING_REQUIRED_FIELD:<column>` 사유가
+붙는다.
+
+숫자형 값에서는 세 상태를 구분한다.
+
+- 값 자체가 비어 있음: `MISSING_REQUIRED_FIELD`
+- 값은 있지만 숫자로 해석할 수 없음: `NON_NUMERIC_REQUIRED_FIELD`
+- `inf` 또는 `-inf`: `NONFINITE_REQUIRED_FIELD`
+
+이 구분은 데이터 오류의 원인을 추적하는 데 중요하다. 예를 들어 빈 bid와 `"unknown"`인 bid는
+같은 문제가 아니다.
+
+### 6.2 Unix timestamp 변환
+
+MarketData의 `updated`, `expiration`, `firstTraded`는 Unix seconds로 해석한다.
+
+```python
+pd.to_datetime(
+    epoch_seconds,
+    unit="s",
+    utc=True,
+    errors="coerce",
+)
+```
+
+- `updated` → `quote_timestamp`
+- `expiration` → `expiry_timestamp`
+- `firstTraded` → `first_traded`
+
+`utc=True`를 사용하기 때문에 서로 다른 로컬 timezone 해석이 개입하지 않는다. 숫자형이지만
+datetime 범위를 벗어나 변환할 수 없는 필수 timestamp에는 `INVALID_TIMESTAMP`가 붙는다.
+
+### 6.3 선택 numeric 필드
+
+다음 값들은 숫자형으로 변환하지만, 결측 또는 0이라는 이유만으로 행을 거절하지 않는다.
+
+```text
+vendor_iv, volume, open_interest, dte, requested_dte,
+bid_size, ask_size, last, intrinsic_value, extrinsic_value,
+delta, gamma, theta, vega
+```
+
+특히 `volume == 0`이나 `open_interest == 0`은 거래 유동성에 대한 정보이지 quote의 구조적
+무효성을 의미하지 않는다. 이후 연구 단계에서 별도 quality filter로 사용할 수 있지만 이
+파이프라인에서는 행을 삭제하지 않는다.
+
+`vendor_iv`도 결측을 임의로 채우지 않고 그대로 둔다. 이 값은 vendor 참고값이며 자체 IV
+solver의 결과가 아니다.
+
+## 7. 5단계: 가격, 시간, moneyness 파생변수 계산
+
+### 7.1 Mid price
+
+```text
+mid = (bid + ask) / 2
+```
+
+API가 raw `mid`를 제공하더라도 프로젝트는 `bid`와 `ask`에서 다시 계산한다. 이렇게 해야
+mid의 정의가 코드에 명시되고 감사 가능하다.
+
+### 7.2 Bid-ask spread
+
+```text
+spread = ask - bid
+relative_spread = spread / mid
+```
+
+`relative_spread`는 절대 가격 수준이 다른 option끼리 quote 폭을 비교하기 위한 값이다.
+`mid > 0`이고 finite일 때만 계산하여 0으로 나누거나 무한대가 생기는 것을 방지한다.
+
+### 7.3 잔존만기 `T`
+
+```text
+T = (expiry_timestamp - quote_timestamp).total_seconds()
+    / (365 × 24 × 60 × 60)
+```
+
+이는 ACT/365F 방식의 연 단위 시간이다. 중요한 점은 date 차이의 정수 일수만 사용하는 것이
+아니라 실제 UTC timestamp의 초 차이를 사용한다는 것이다.
+
+현재 snapshot에서는 다음과 같다.
+
+```text
+quote_timestamp  = 2026-07-15T20:00:00Z
+expiry_timestamp = 2026-08-14T20:00:00Z
+T                = 30 / 365 ≈ 0.08219178
+```
+
+### 7.4 Spot moneyness
+
+```text
+spot_moneyness = strike / spot
+log_spot_moneyness = log(strike / spot)
+```
+
+둘 다 `strike > 0`, `spot > 0`이고 finite일 때만 계산한다.
+
+- `spot_moneyness < 1`: strike가 spot보다 낮다.
+- `spot_moneyness = 1`: strike와 spot이 같다.
+- `spot_moneyness > 1`: strike가 spot보다 높다.
+
+다만 call과 put의 ITM/OTM 해석은 방향이 다르므로, 이 비율만으로 option type별 ITM 여부를
+동일하게 해석하면 안 된다.
+
+### 7.5 분석 후보 flag
+
+```text
+analysis_candidate = 0.85 <= spot_moneyness <= 1.15
+```
+
+이 값은 임시 연구 범위를 나타내는 boolean flag다.
+
+- `True`라고 해서 더 유효한 행이라는 뜻은 아니다.
+- `False`라고 해서 rejected 행이라는 뜻도 아니다.
+- accepted 데이터에는 범위 밖의 deep ITM/OTM 행도 남는다.
+
+즉, `accepted_df`는 **데이터 품질 필터 결과**이고, `analysis_candidate`는 그 안에서 사용할 수
+있는 **연구 표본 선택 flag**다.
+
+현재는 금리와 배당 입력이 없으므로 spot 기준 moneyness만 사용한다. 다음 컬럼은 만들거나
+추정하지 않는다.
+
+```text
+risk_free_rate
+dividend_yield
+forward
+log_forward_moneyness
+```
+
+## 8. 6단계: 행별 validation과 rejection reason 누적
+
+각 행은 여러 문제를 동시에 가질 수 있다. 파이프라인은 첫 오류에서 멈추지 않고 가능한 모든
+사유를 `reasons` list에 누적한다.
+
+| Rejection reason | 발생 조건 |
+|---|---|
+| `MISSING_REQUIRED_FIELD:<column>` | 필수 값이 null 또는 빈 문자열 |
+| `NON_NUMERIC_REQUIRED_FIELD:<column>` | 필수 숫자/timestamp 원본이 숫자로 변환되지 않음 |
+| `NONFINITE_REQUIRED_FIELD:<column>` | 필수 숫자/timestamp가 `inf` 또는 `-inf` |
+| `INVALID_TIMESTAMP:<column>` | finite Unix seconds지만 UTC datetime으로 변환되지 않음 |
+| `INVALID_OPTION_TYPE` | 결측이 아닌 `option_type`이 `call`, `put` 중 하나가 아님 |
+| `NONPOSITIVE_STRIKE` | `strike <= 0` |
+| `NONPOSITIVE_SPOT` | `spot <= 0` |
+| `NONPOSITIVE_BID` | `bid <= 0` |
+| `CROSSED_QUOTE` | `ask < bid` |
+| `NONPOSITIVE_MID` | finite `mid <= 0` |
+| `NONPOSITIVE_TTM` | finite `T <= 0` |
+| `DUPLICATE_OPTION_SYMBOL` | 같은 `option_symbol`이 두 번 이상 존재 |
+
+중복 symbol은 `duplicated(keep=False)`로 판정한다. 따라서 첫 번째 행을 남기고 나머지만
+거절하는 것이 아니라 중복 집합의 모든 occurrence를 거절한다. 어느 행이 진짜인지 임의로
+선택하지 않기 위해서다.
+
+한 행에 여러 문제가 있으면 최종 `rejection_reason`은 다음과 같이 `|`로 연결된다.
+
+```text
+NONPOSITIVE_BID|CROSSED_QUOTE
+```
+
+사유가 하나도 없는 행은 빈 문자열을 가지며 `accepted_mask`가 `True`가 된다.
+
+```python
+accepted_mask = working_df["rejection_reason"].eq("")
+accepted_df = working_df.loc[accepted_mask]
+rejected_df = working_df.loc[~accepted_mask]
+```
+
+`accepted_df`에서는 빈 `rejection_reason` 컬럼을 제거한다. `rejected_df`에서는 왜 거절됐는지
+추적해야 하므로 그대로 보존한다.
+
+## 9. 7단계: processed와 rejected CSV 저장
+
+raw는 외부에서 받은 불변 입력이고, 다음 두 파일은 노트북으로 재생성 가능한 파생 결과다.
+
+### Processed output
+
+```text
+data/processed/marketdata_spx/
+SPX_2026-07-15_dte030_pm_sl450_processed.csv
+```
+
+용도:
+
+- 기본 quote와 식별자가 유효한 option 행
+- 이후 smile 분석, 모델 입력 설계, IV solver 준비 등에 사용할 기반 데이터
+- 현재는 `analysis_candidate` 여부와 무관하게 모든 accepted 행을 포함
+
+### Rejected output
+
+```text
+data/interim/marketdata_spx/
+SPX_2026-07-15_dte030_pm_sl450_rejected.csv
+```
+
+용도:
+
+- 제외된 행을 버리지 않고 보관
+- 공급자 데이터 문제와 validation 정책을 검토
+- `rejection_reason`별 데이터 품질 이슈를 집계
+- 정책을 바꿀 때 원래 raw 행으로 추적
+
+CSV는 dtype metadata를 저장하지 않는다. 따라서 이후 별도 Python 프로세스에서 processed
+CSV를 다시 읽어 계산할 때는 `quote_timestamp`, `expiry_timestamp`, `first_traded`를
+`pd.to_datetime(..., utc=True)`로 다시 파싱해야 한다.
+
+## 10. 8단계: 마지막 감사 셀의 역할
+
+감사 셀은 결과를 보여주는 요약 셀이면서, 파이프라인의 핵심 invariant를 실행 시점에 검증하는
+테스트 역할도 한다.
+
+### 10.1 출력하는 정보
+
+- raw / accepted / rejected / analysis candidate 행 수
+- `raw = accepted + rejected` 여부
+- accepted call/put별 행 수
+- 실제 `expiry_timestamp` 값과 만기 개수
+- accepted 고유 strike 수
+- accepted spot moneyness 최소·최대
+- accepted relative spread 분위수
+- accepted 필수 output 컬럼의 결측 수
+- raw와 accepted의 중복 option symbol 행 수
+- 개별 rejection reason별 행 수
+- 저장한 processed/rejected CSV 재로딩 행 수
+
+복수 사유 문자열은 `|`로 분리한 뒤 `explode()`하므로, 조합 문자열이 아니라 개별 이유별로
+정확히 집계된다.
+
+### 10.2 assertion으로 검증하는 invariant
+
+감사 셀은 다음 조건 중 하나라도 깨지면 실패한다.
+
+- raw 행 수가 accepted와 rejected의 합과 다름
+- accepted와 rejected의 `raw_row_number`가 겹침
+- 두 결과의 행 번호 합집합이 raw 전체 행 번호와 다름
+- accepted가 비어 있음
+- accepted 필수 output에 결측이 있음
+- option type이 `call` 또는 `put`이 아님
+- `strike`, `spot`, `bid`, `mid`, `T`가 양수가 아님
+- `ask < bid`
+- 주요 파생 숫자에 `NaN` 또는 무한대가 있음
+- accepted에 중복 option symbol이 있음
+- 저장 후 다시 읽은 CSV 행 수가 메모리의 DataFrame과 다름
+- 현재 범위 밖의 rate/dividend/forward 컬럼이 생성됨
+
+따라서 노트북이 마지막까지 실행됐다는 사실만으로 최소 데이터 계약이 함께 확인된다.
+
+## 11. 현재 snapshot의 실제 실행 결과
+
+현재 저장된 snapshot을 기준으로 파이프라인 결과는 다음과 같다.
+
+| 항목 | 결과 |
+|---|---:|
+| Raw contracts | 430 |
+| Accepted | 424 |
+| Rejected | 6 |
+| Analysis candidates | 352 |
+| Accepted calls | 213 |
+| Accepted puts | 211 |
+| Actual expiries | 1 |
+| Unique accepted strikes | 215 |
+| Spot moneyness minimum | 0.31694004 |
+| Spot moneyness maximum | 1.29417183 |
+
+실제 만기는 `2026-08-14T20:00:00Z` 한 개다. 거절 6행은 모두
+`NONPOSITIVE_BID`이며, raw의 430행은 accepted 424행과 rejected 6행으로 완전히 보존됐다.
+
+accepted 데이터에는 다음과 같은 zero-liquidity metadata도 남아 있다.
+
+- `volume == 0`: 174행
+- `open_interest == 0`: 133행
+
+이는 거래량이나 미결제약정이 0인 것만으로 quote를 제거하지 않는 정책이 실제로 적용됐음을
+보여준다. 현재 snapshot의 `vendor_iv`는 모두 결측이지만, 자체 IV나 임의의 값으로 채우지
+않았다.
+
+## 12. 핵심 함수와 객체의 역할
+
+### 12.1 `spx_chain_path`
+
+위치: `src/option_pricing_volatility/market_data/spx.py`
+
+```python
+spx_chain_path(
+    quote_date,
+    target_dte,
+    strike_limit,
+    *,
+    raw_dir,
+) -> Path
+```
+
+책임:
+
+- 고정된 naming convention으로 PM SPX raw 경로를 생성한다.
+- 동일 조건이 항상 동일 cache key와 파일명으로 연결되게 한다.
+
+이 함수는 파일을 읽거나 쓰지 않는다. 경로만 계산하는 순수한 helper다.
+
+### 12.2 `download_spx_chain`
+
+위치: `src/option_pricing_volatility/market_data/spx.py`
+
+```python
+download_spx_chain(
+    quote_date,
+    target_dte=30,
+    strike_limit=10,
+    *,
+    raw_dir=DEFAULT_RAW_DIR,
+    api_token=None,
+    timeout=60.0,
+) -> pd.DataFrame
+```
+
+책임:
+
+- 요청 인자의 형식과 양수 조건을 검증한다.
+- raw cache가 있으면 API보다 cache를 우선한다.
+- 빈 raw cache를 blocker로 처리한다.
+- raw가 없을 때만 인증을 확인한다.
+- PM expiration 조건으로 API를 한 번 호출한다.
+- response의 HTTP, JSON, vendor status, row 구조를 검증한다.
+- 성공한 DataFrame에 요청 metadata를 보완한다.
+- 기존 raw를 덮어쓰지 않고 새 raw 파일만 생성한다.
+- cache 또는 신규 raw를 `pd.DataFrame`으로 반환한다.
+
+이 함수가 하지 않는 일:
+
+- 컬럼을 분석용 schema로 정규화하지 않는다.
+- mid, spread, `T`, moneyness를 계산하지 않는다.
+- 잘못된 option 행을 accepted/rejected로 나누지 않는다.
+- 다른 날짜나 DTE로 자동 retry하지 않는다.
+- BSM, IV, forward를 계산하지 않는다.
+
+### 12.3 `MarketDataDownloadError`
+
+위치: `src/option_pricing_volatility/market_data/spx.py`
+
+정상 raw를 안전하게 만들 수 없는 모든 다운로드 단계의 기본 오류다. 예를 들어 다음 상황에
+사용된다.
+
+- 빈 raw cache 존재
+- 토큰 누락
+- 네트워크 실패
+- 허용되지 않은 HTTP status
+- 잘못된 JSON 또는 API status
+- 서로 다른 response column 길이
+- 다운로드 중 동일 raw 경로가 새로 생김
+
+오류 메시지에는 토큰과 vendor 오류문을 포함하지 않는다.
+
+### 12.4 `MarketDataNoDataError`
+
+위치: `src/option_pricing_volatility/market_data/spx.py`
+
+`MarketDataDownloadError`의 하위 클래스다. API가 명시적으로 `no_data`를 반환하거나 list
+field에서 option 행을 만들 수 없을 때 사용한다.
+
+별도 하위 클래스로 둔 이유는 호출자가 “통신/형식 실패”와 “요청 조건에 데이터가 없음”을
+구분할 수 있게 하기 위해서다. 두 경우 모두 가짜 데이터는 만들지 않는다.
+
+### 12.5 `to_snake_case`
+
+위치: 전처리 노트북의 `preprocess` 셀
+
+```python
+to_snake_case(name: object) -> str
+```
+
+책임:
+
+1. 공백과 특수문자를 underscore로 바꾼다.
+2. 대문자 단어 경계를 분리한다.
+3. 소문자로 통일한다.
+4. 문자열 양끝 underscore를 제거한다.
+
+예:
+
+```text
+optionSymbol    -> option_symbol
+underlyingPrice -> underlying_price
+openInterest    -> open_interest
+```
+
+이 함수는 “표기 형식”만 바꾼다. `underlying_price -> spot`처럼 금융적 의미를 부여하는
+rename은 별도의 mapping이 담당한다.
+
+### 12.6 `blank_mask`
+
+위치: 전처리 노트북의 `preprocess` 셀
+
+```python
+blank_mask(series: pd.Series) -> pd.Series
+```
+
+책임:
+
+- `NaN`, `None`, `pd.NA` 같은 null을 찾는다.
+- 공백만 있는 문자열도 결측으로 판정한다.
+- 각 행이 결측인지 나타내는 boolean Series를 반환한다.
+
+숫자 변환 전에 이 mask를 만드는 이유는 빈 값과 숫자가 아닌 값을 서로 다른 rejection
+reason으로 기록하기 위해서다.
+
+### 12.7 `add_reason`
+
+위치: 전처리 노트북의 `preprocess` 셀
+
+```python
+add_reason(mask: pd.Series, reason: str) -> None
+```
+
+책임:
+
+- boolean mask가 `True`인 모든 raw 행을 찾는다.
+- 해당 행의 `reasons` list에 안정적인 reason code를 추가한다.
+- 한 행에 여러 reason을 누적할 수 있게 한다.
+
+`add_reason`은 값을 반환하지 않고 바깥 scope의 `reasons`를 변경하는 notebook-local helper다.
+최종적으로 각 행의 list는 중복 제거 후 `|`로 연결되어 `rejection_reason`이 된다.
+
+## 13. 함수가 아닌 핵심 처리 블록의 역할
+
+노트북에는 함수로 추출하지 않은 vectorized 처리도 있다. 이 코드는 현재 단일 snapshot의
+전처리 orchestration에만 쓰이므로 노트북에 남아 있다.
+
+| 처리 블록 | 역할 |
+|---|---|
+| semantic rename mapping | vendor 필드에 프로젝트 의미 부여 |
+| required-field loops | text/numeric/timestamp dtype 정규화와 reason 기록 |
+| optional numeric loop | 참고·유동성 필드를 가능한 범위에서 숫자형으로 변환 |
+| derived-field block | mid, spread, relative spread, `T`, moneyness 계산 |
+| validation block | 금융·구조 조건별 rejection reason 추가 |
+| accepted/rejected split | 전체 행을 상호 배타적인 두 결과로 분리 |
+| save block | 재생성 가능한 CSV 두 개 저장 |
+| audit block | 요약 출력, reload, invariant assertion |
+
+향후 동일한 SPX 전처리가 여러 노트북에서 재사용되기 시작하면 이 vectorized 처리 전체를
+package 함수로 승격하는 것이 적절하다. 현재는 한 snapshot의 schema를 이해하고 감사하는
+단계이므로 노트북에 명시적으로 남겨 두었다.
+
+## 14. 재실행할 때 일어나는 일
+
+최초 성공 실행:
+
+```text
+raw 없음 → API 1회 → raw 신규 저장 → 전처리 → processed/rejected 저장 → audit
+```
+
+두 번째 이후 실행:
+
+```text
+raw nonempty → cache read → 전처리 → processed/rejected 재생성 → audit
+```
+
+재실행 시 processed와 rejected는 현재 코드로 다시 만들어지지만 raw는 읽기만 한다. 따라서
+전처리 정책을 수정했을 때 동일한 외부 snapshot을 기준으로 결과 차이를 비교할 수 있다.
+
+## 15. 현재 단계에서 의도적으로 하지 않는 일
+
+이 파이프라인은 option 가격 모델링 이전의 데이터 준비 단계다. 다음 작업은 포함하지 않는다.
+
+- Black–Scholes–Merton 가격 계산
+- 프로젝트 자체 implied volatility 계산
+- risk-free rate 수집 또는 추정
+- dividend yield 수집 또는 추정
+- call-put parity를 이용한 forward 추정
+- `log_forward_moneyness` 계산
+- 그래프 작성
+- 여러 날짜 또는 여러 만기 수집
+- volume/open interest 기반 liquidity filter
+
+따라서 processed CSV는 “모든 모델 입력이 완성된 최종 테이블”이 아니라, raw option chain에서
+구조적으로 유효한 quote를 감사 가능하게 정리한 **분석 준비 데이터**다.
+
+## 16. 핵심 요약
+
+이 파이프라인의 핵심은 다음 문장으로 요약할 수 있다.
+
+> 외부 API snapshot은 한 번만 immutable raw로 고정하고, 모든 raw 행을 추적 가능한 상태로
+> 정규화한 뒤, 구조적으로 유효한 행과 거절된 행을 이유와 함께 분리하며, 저장 결과를 다시
+> 읽어 행 보존과 금융적 최소 조건을 검증한다.
+
+이 구조를 유지하면 이후 BSM, Monte Carlo, 자체 IV, delta hedging 단계가 추가되더라도
+“모델이 이상한지”와 “입력 데이터가 이상한지”를 분리해서 분석할 수 있다.
