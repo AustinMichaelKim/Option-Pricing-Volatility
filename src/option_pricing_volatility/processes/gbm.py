@@ -9,12 +9,18 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+"""
+src/simulation/monte_carlo.py에서 호출되는 함수이다.
+몬테카를로 샘플링을 위해서, GBM 확률과정에 기반한 주가 샘플링을 수행한다.
+노트북에 설명된, 로그정규분포에서 샘플링을 수행한다.
+"""
 def sample_gbm_terminal(
+        
     spot: float,
     maturity: float,
     rate: float,
     volatility: float,
-    n_paths: int,
+    n_paths: int, # 샘플링할 경로의 수이다. 즉, n_paths개의 주가 샘플링을 수행한다.
     dividend_yield: float = 0.0,
     *,
     rng: np.random.Generator,
@@ -34,6 +40,10 @@ def sample_gbm_terminal(
         "volatility": volatility,
         "dividend_yield": dividend_yield,
     }
+
+    """
+    입력값 유효검사 단계
+    """
     for name, value in numeric_inputs.items():
         if (
             isinstance(value, bool)
@@ -53,6 +63,7 @@ def sample_gbm_terminal(
     if not isinstance(rng, np.random.Generator):
         raise TypeError("rng must be a numpy.random.Generator")
 
+    # 형변환
     spot = float(spot)
     maturity = float(maturity)
     rate = float(rate)
@@ -60,6 +71,7 @@ def sample_gbm_terminal(
     dividend_yield = float(dividend_yield)
     n_paths = int(n_paths)
 
+    # 경계조건
     if maturity == 0:
         return np.full(n_paths, spot, dtype=np.float64)
 
@@ -68,6 +80,11 @@ def sample_gbm_terminal(
         terminal_spot = spot * math.exp(drift)
         return np.full(n_paths, terminal_spot, dtype=np.float64)
 
+    """
+    난수 샘플링 단계. 입력으로 받은 난수생성기 rng를 이용해서 샘플링한다.
+    terminal_spots는 샘플링할 만기 주가이다.
+    노트북에 설명된 공식 참조.
+    """
     normal_samples = rng.standard_normal(n_paths)
     diffusion = volatility * math.sqrt(maturity) * normal_samples
     terminal_spots = spot * np.exp(drift + diffusion)
