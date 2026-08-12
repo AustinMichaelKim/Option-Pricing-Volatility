@@ -67,3 +67,15 @@
   market midpoint vs constant-volatility BSM의 네 결과로 제한한다.
 - Consequence: KOSPI 200, delta hedging, 전체 Greeks와 volatility surface는
   활성 범위에서 제외한다.
+
+## D-009: Scalar implied volatility uses bracketed bisection
+
+- Date: 2026-08-12
+- Status: accepted
+- Decision: European call/put implied volatility is inverted from the existing
+  BSM price with scalar bisection on the default volatility bracket
+  `[1e-8, 5.0]`. A target matching the zero-volatility price within the price
+  tolerance maps to `0.0` before the positive-volatility bracket is checked.
+- Consequence: invalid prices and missing roots raise `ValueError`, iteration
+  exhaustion raises `RuntimeError`, and successful results retain signed
+  repricing error and iteration diagnostics.

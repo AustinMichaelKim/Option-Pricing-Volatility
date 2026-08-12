@@ -147,14 +147,31 @@ and `q`.
 Before root finding:
 
 1. validate ordinary input domains;
-2. reject `T = 0` unless the target equals intrinsic value within tolerance;
+2. require `T > 0` because implied volatility is not uniquely identified at
+   expiry;
 3. check the target against the relevant no-arbitrage bounds;
 4. define and document solver bracket, price tolerance, volatility tolerance,
    and maximum iterations.
 
-The default robust implementation should use a bracketed solver. Newton's
-method may be an optional acceleration, but it must not be the only path unless
-its failure behavior is explicit.
+The initial scalar implementation uses bisection with these defaults:
+
+```text
+volatility bracket = [1e-8, 5.0]
+price tolerance = 1e-8
+volatility tolerance = 1e-12
+maximum iterations = 200
+```
+
+The no-arbitrage and bracket price ranges are strict validity checks and are
+not enlarged by a numerical tolerance. Before checking the positive-volatility
+bracket, a target within the price tolerance of the `sigma = 0` BSM price
+returns an implied volatility of exactly `0.0`. Bisection converges when either
+the absolute repricing error is within the price tolerance or the volatility
+bracket width is within the volatility tolerance.
+
+An invalid target or a target outside the configured bracket raises
+`ValueError`. Exhausting the maximum iterations raises `RuntimeError` rather
+than returning an endpoint or unconverged estimate.
 
 Do not silently:
 
@@ -162,8 +179,8 @@ Do not silently:
 - return a bracket endpoint as though it were a converged root;
 - replace a failed result with `NaN` without a reason code or exception.
 
-A successful result should expose the volatility, repricing error, iteration
-count when available, and convergence status.
+A successful result exposes the volatility, signed repricing error
+`BSM_price - target_price`, iteration count, and convergence status.
 
 ## 7. Delta-hedging contract
 
