@@ -1,90 +1,95 @@
 # Option Pricing and Volatility Analysis
 
-Hull의 옵션 관련 장을 읽고, 실제 옵션 데이터를 이용해 가격결정 모형과
-변동성 분석을 단계적으로 실험하는 Python 프로젝트입니다.
+SPX 옵션 데이터를 이용해 CRR, Black–Scholes–Merton, GBM Monte Carlo와
+implied volatility를 구현하고 비교하는 교육·포트폴리오 프로젝트입니다.
+Notebook은 실험과 해석에 사용하고, 재사용 계산은 Python package와 pytest로
+검증합니다.
 
-이 저장소는 Jupyter Notebook을 주 작업 공간으로 사용합니다. 노트북에서
-아이디어를 검증한 뒤 재사용할 가치가 있는 계산 로직만 `src/` 패키지로
-옮깁니다.
+## 연구 질문
+
+1. CRR 가격은 시간 스텝이 증가할 때 BSM 가격에 수렴하는가?
+2. Monte Carlo 가격은 경로 수가 증가할 때 BSM 가격에 수렴하며,
+   표준오차는 대략 `M^(-1/2)`로 감소하는가?
+3. 고정된 SPX 옵션체인에서 implied-volatility skew는 어떤 형태인가?
+4. 시장 midpoint와 ATM implied volatility를 고정한 BSM 가격은 어떻게
+   다른가?
+
+## 현재 상태
+
+| 영역 | 상태 |
+| --- | --- |
+| SPX MarketData 수집과 전처리 | 완료 |
+| CRR binomial pricing | 완료 |
+| Risk-neutral GBM과 Monte Carlo pricing | 완료 |
+| BSM closed-form pricing | 완료 |
+| Bisection implied-volatility solver | 다음 작업 |
+| 네 개의 최종 그림과 보고서 | 예정 |
 
 ## 범위
 
-- 실제 옵션체인 수집 및 정리
-- Binomial option pricing
-- Geometric Brownian Motion (GBM)
-- Black-Scholes-Merton (BSM)
-- Monte Carlo simulation
-- Implied volatility
-- Delta hedging
-- Hull Chapter 10, 11, 13, 14, 15 독해 기록
+포함 범위는 European-style SPX call/put, 단일 snapshot·단일 만기,
+midpoint 기반 IV, CRR/MC 수렴과 constant-volatility BSM 비교입니다.
 
-현재 단계에서는 프로젝트 구조만 제공합니다. 금융모형의 계산 로직은 아직
-구현하지 않습니다.
+KOSPI 200, American/exotic option, delta hedging, stochastic volatility,
+다중 만기 surface, 거래전략과 production pipeline은 현재 범위 밖입니다.
 
-## 작업 흐름
-
-1. `docs/reading_notes/`에 개념, 수식, 가정과 질문을 정리합니다.
-2. 주제에 대응하는 `notebooks/` 하위 디렉터리에서 실험합니다.
-3. 데이터 처리나 계산 로직이 안정되면 작은 함수 단위로 `src/`에 옮깁니다.
-4. 이후 노트북은 복사된 코드를 유지하지 않고 `src` 패키지에서 import합니다.
-5. 옮긴 로직에는 `tests/`의 pytest 테스트를 추가합니다.
-
-노트북은 `01_topic_description.ipynb`처럼 실행 순서를 알 수 있는 이름을
-사용합니다. 커밋하기 전 출력에 원본 데이터나 비밀정보가 포함되지 않았는지
-확인합니다.
-
-## 디렉터리
+## 구조
 
 ```text
 .
-├── data/                         # 로컬 데이터 저장소(Git 제외)
+├── data/                             # Git에서 제외되는 로컬 데이터
 │   ├── raw/
 │   ├── interim/
 │   └── processed/
-├── docs/reading_notes/           # Hull 독해 노트
-├── notebooks/                    # 탐색, 실험, 그래프의 주 작업 공간
+├── docs/                             # 계약, 결정, 구현 설명
+├── notebooks/
 │   ├── 00_sandbox/
 │   ├── 01_option_chain/
 │   ├── 02_binomial/
-│   ├── 03_gbm/
+│   ├── 03_gbm_mc/
 │   ├── 04_bsm/
-│   ├── 05_monte_carlo/
-│   ├── 06_implied_volatility/
-│   └── 07_delta_hedging/
-├── src/option_pricing_volatility/ # 검증된 재사용 Python 코드
-└── tests/                         # pytest 테스트
+│   └── 05_implied_volatility/
+├── src/option_pricing_volatility/
+│   ├── market_data/
+│   ├── models/
+│   ├── processes/
+│   ├── simulation/
+│   └── volatility/
+└── tests/
 ```
+
+## 작업 원칙
+
+1. Notebook에서 식과 실험 구조를 확인합니다.
+2. 재사용하거나 테스트해야 하는 계산은 `src`에 구현합니다.
+3. Notebook은 package 함수를 import하고 그래프와 해석에 집중합니다.
+4. 구현 변경에는 관련 pytest를 추가하거나 수정합니다.
+
+세부 금융 계약은 `docs/model_contracts.md`, SPX 데이터 계약은
+`docs/data_contracts.md`, 주요 설계 결정은 `docs/decisions.md`를 따릅니다.
 
 ## 개발 환경
 
-프로젝트 루트에서 가상환경을 만들고 개발 및 노트북 dependency를
-설치합니다. 두 그룹은 선택 dependency이며 패키지의 런타임 dependency는
-없습니다.
-
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+conda activate finance
 python -m pip install -e ".[dev,notebook]"
-python -m jupyter lab
-```
-
-패키지 import와 테스트는 다음과 같이 확인합니다.
-
-```bash
-python -c "import option_pricing_volatility"
 python -m pytest
-```
-
-editable install 전에는 다음처럼 직접 확인할 수 있습니다.
-
-```bash
-PYTHONPATH=src python3 -c "import option_pricing_volatility"
+python -m jupyter lab
 ```
 
 ## 데이터와 비밀정보
 
-- 다운로드한 옵션체인과 모든 파생 데이터는 `data/` 아래에만 저장합니다.
-- `data/README.md`와 디렉터리 유지용 `.gitkeep` 이외의 데이터 파일은 Git에서
-  제외됩니다.
-- API 키와 계정 정보는 `.env` 같은 로컬 파일에만 두며 커밋하지 않습니다.
-- 재현에 필요한 환경변수 이름이 생기면 값이 없는 `.env.example`만 추가합니다.
+- MarketData token은 환경변수 `MARKETDATA_TOKEN`으로만 관리합니다.
+- raw snapshot은 한 번 저장한 뒤 덮어쓰지 않습니다.
+- raw, interim, processed CSV는 Git에 커밋하지 않습니다.
+- 최종 결과에는 사용한 snapshot, `r`, `q`, `sigma_ATM` 정의와 Git commit을
+  기록합니다.
+
+## 최종 산출물
+
+- `binomial_convergence`
+- `mc_convergence`
+- `iv_skew`
+- `market_vs_constant_vol_bsm`
+- 검증된 package와 tests
+- 짧은 결과 보고서

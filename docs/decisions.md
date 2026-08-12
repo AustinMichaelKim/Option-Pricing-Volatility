@@ -1,127 +1,69 @@
 # Project Decisions
 
-Record decisions that materially affect architecture, financial meaning,
-numerical behavior, data interpretation, or reproducibility.
+이 문서는 금융적 의미, numerical behavior, 데이터 해석 또는 저장소 구조를
+바꾸는 결정만 기록한다.
 
-## Decision template
-
-```text
-## D-XXX: Short title
-
-- Date: YYYY-MM-DD
-- Status: proposed | accepted | superseded
-- Context:
-- Decision:
-- Rationale:
-- Consequences:
-- Related files:
-```
-
-## D-001: Use a package-first architecture
+## D-001: Package-first reusable code
 
 - Date: 2026-07-28
 - Status: accepted
-- Context: Exploratory notebooks are useful for learning, but duplicated model
-  code makes results difficult to test and audit.
-- Decision: Reusable calculations live under
-  `src/option_pricing_volatility/`; notebooks orchestrate, visualize, and
-  interpret package code.
-- Rationale: This preserves an educational notebook workflow while producing a
-  testable portfolio project.
-- Consequences: Once notebook code becomes reusable, it must be promoted and
-  the duplicate implementation removed.
-- Related files: `AGENTS.md`, `docs/project_brief.md`.
+- Decision: 재사용 계산은 `src/option_pricing_volatility/`, 실험과 해석은
+  notebooks, 검증은 tests에 둔다.
+- Consequence: package로 옮긴 구현을 notebook에 중복 유지하지 않는다.
 
-## D-002: Use continuously compounded rates and dividend yields
+## D-002: Common rate and time conventions
 
 - Date: 2026-07-28
 - Status: accepted
-- Context: BSM, CRR, GBM, and put-call parity require a consistent rate
-  convention.
-- Decision: Default to continuously compounded annual `r` and `q`, expressed as
-  decimals.
-- Rationale: This matches the initial analytical formulas and risk-neutral
-  simulation contract.
-- Consequences: Any data source supplying another convention must be converted
-  explicitly.
-- Related files: `docs/model_contracts.md`.
+- Decision: `r`, `q`는 연속복리 연율 소수, `T`는 ACT/365F 연 단위를
+  사용한다.
+- Consequence: 다른 source convention은 명시적으로 변환한다.
 
-## D-003: Use ACT/365F for the initial year fraction
+## D-003: Midpoint as observed market price
 
 - Date: 2026-07-28
 - Status: accepted
-- Context: Option data requires a reproducible conversion from timestamps to
-  years.
-- Decision: Use actual elapsed calendar time divided by 365 days for the first
-  project version.
-- Rationale: It is simple, explicit, and adequate for the educational analysis.
-- Consequences: Results may differ slightly from vendor or exchange conventions;
-  comparisons must document this.
-- Related files: `docs/data_contracts.md`, `docs/model_contracts.md`.
+- Decision: 유효한 two-sided quote의 `(bid + ask) / 2`를 IV target과 시장
+  비교 가격으로 사용한다.
+- Consequence: `last`나 vendor IV를 조용히 대체값으로 사용하지 않는다.
 
-## D-004: Use midpoint as the default observed option price
+## D-004: European call/put scope
 
 - Date: 2026-07-28
 - Status: accepted
-- Context: Last trade can be stale, while bid or ask alone reflects one side of
-  the market.
-- Decision: For a valid two-sided quote, use `(bid + ask) / 2` as the default
-  implied-volatility target.
-- Rationale: It is a transparent baseline for educational cross-sectional
-  analysis.
-- Consequences: Invalid or one-sided quotes are flagged rather than silently
-  replaced with last trade.
-- Related files: `docs/data_contracts.md`.
+- Decision: 현재 pricing과 IV 범위는 European call/put으로 제한한다.
+- Consequence: American/exotic pricing은 별도 범위 변경 없이는 구현하지 않는다.
 
-## D-005: Limit the first pricing scope to European calls and puts
+## D-005: Explicit randomness and failure
 
 - Date: 2026-07-28
 - Status: accepted
-- Context: The core project focuses on BSM, Monte Carlo, implied volatility, and
-  delta hedging.
-- Decision: The first complete implementation supports European calls and puts.
-- Rationale: This keeps analytical benchmarks available and controls project
-  scope.
-- Consequences: American contracts from real option chains must be interpreted
-  cautiously; American pricing is a later extension rather than silently
-  treated as identical.
-- Related files: `docs/project_brief.md`, `docs/model_contracts.md`.
+- Decision: randomized functions는 명시적 Generator 또는 seed를 받고,
+  invalid inputs와 nonconvergence는 예외나 reason code로 드러낸다.
+- Consequence: clipping과 global mutable RNG를 사용하지 않는다.
 
-## D-006: Require explicit random-number control
+## D-006: Provider initially provisional
 
 - Date: 2026-07-28
+- Status: superseded
+- Decision: 초기에는 실제 option-chain provider를 고정하지 않았다.
+- Superseded by: D-007.
+
+## D-007: Use one fixed MarketData SPX snapshot
+
+- Date: 2026-08-09
 - Status: accepted
-- Context: Monte Carlo and hedging experiments must be reproducible and tests
-  must not rely on global mutable state.
-- Decision: Randomized public functions accept a NumPy `Generator` or explicit
-  seed.
-- Rationale: This enables deterministic debugging and controlled experiments.
-- Consequences: Convenience functions must not hide uncontrolled global RNG use.
-- Related files: `AGENTS.md`, `docs/model_contracts.md`.
+- Decision: MarketData의 `2026-07-15` SPX historical snapshot에서 PM-settled
+  단일 만기를 사용한다. Raw cache를 불변 입력으로 보존한다.
+- Consequence: provider mapping은 market-data 계층에만 두고 모델 코드는
+  SPX API 응답 형식에 의존하지 않는다.
+- Related: `docs/data_contracts.md`.
 
-## D-007: Do not silently repair financially invalid inputs
+## D-008: Final MVP is four figures
 
-- Date: 2026-07-28
+- Date: 2026-08-12
 - Status: accepted
-- Context: Clipping prices, probabilities, solver brackets, or volatility can
-  make code appear successful while changing the financial problem.
-- Decision: Invalid domains and nonconvergent numerical cases produce
-  informative errors or explicit failure results.
-- Rationale: Auditability and learning value are more important than producing a
-  number for every input.
-- Consequences: Notebooks must display and interpret exclusions and failures.
-- Related files: `docs/model_contracts.md`, `docs/data_contracts.md`.
-
-## D-008: Leave the market-data provider provisional
-
-- Date: 2026-07-28
-- Status: proposed
-- Context: The repository structure is ready, but the first real option-chain
-  source has not yet been fixed in this document set.
-- Decision: Select the provider during M1 and record access method, licensing,
-  timestamps, field mapping, and reproducibility constraints here.
-- Rationale: Provider choice affects schema mapping and what data may be stored
-  or shared.
-- Consequences: Do not build provider-specific assumptions into core financial
-  modules.
-- Related files: `docs/roadmap.md`, `docs/data_contracts.md`.
+- Decision: 최종 MVP는 binomial convergence, MC convergence, SPX IV skew,
+  market midpoint vs constant-volatility BSM의 네 결과로 제한한다.
+- Consequence: KOSPI 200, delta hedging, 전체 Greeks와 volatility surface는
+  활성 범위에서 제외한다.

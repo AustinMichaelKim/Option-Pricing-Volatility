@@ -1,209 +1,140 @@
-# KOSPI 200 Option Data Contract
+# SPX Option Data Contract
 
-This document defines the minimum contract for turning one fixed KOSPI 200
-option-chain snapshot into model-ready inputs. It covers the Stage 1 path:
-
-```text
-raw -> normalized -> validated -> model-ready
-```
-
-Provider-specific column names remain provisional until the first real snapshot
-is audited. Unknown values must be recorded as `TBD` or rejected; they must not
-be guessed.
-
-## 1. Storage and immutability
-
-### `data/raw/`
-
-- Store the source snapshot exactly as downloaded or exported.
-- Never overwrite or edit a raw file in place.
-- Keep market downloads uncommitted unless redistribution is permitted.
-- Record the source filename, file checksum, acquisition time, and provider.
-
-### `data/interim/`
-
-- Store normalized rows and rejected rows separately.
-- Preserve the original provider columns needed for audit and debugging.
-
-### `data/processed/`
-
-- Store only reproducible, model-ready tables.
-- Every processed file must be reproducible from a raw snapshot, configuration,
-  and code version.
-
-## 2. Required snapshot metadata
-
-Each snapshot must record:
-
-- `snapshot_id`;
-- provider and acquisition/export method;
-- acquisition time and the quote time represented by the data;
-- original timezone and normalized timezone;
-- market session;
-- underlying reference value and its observation time;
-- contract expiry convention, exercise style, settlement type, multiplier, and
-  currency;
-- source filename and checksum;
-- redistribution or storage restrictions;
-- configuration and Git commit used for transformation.
-
-A missing value may be marked `TBD` during raw inspection. A row cannot become
-model-ready when the missing value materially changes `S`, `K`, `T`, option
-identity, or the pricing convention.
-
-## 3. Normalized schema
-
-The raw provider field corresponding to each normalized field must be added
-after snapshot inspection.
-
-| Field | Type | Nullable | Source or rule |
-|---|---|---:|---|
-| `underlying` | string | no | Canonical identifier, initially `KOSPI200` |
-| `contract_id` | string | yes | Provider symbol or stable contract identifier |
-| `quote_timestamp` | timezone-aware datetime | no | Provider quote time; normalize to UTC |
-| `expiry_timestamp` | timezone-aware datetime | no* | Provider expiry, or a documented date-only assumption |
-| `option_type` | string | no | Normalize to `call` or `put` |
-| `strike` | float64 | no | Positive index-point strike |
-| `bid` | float64 | yes | Best bid |
-| `ask` | float64 | yes | Best ask |
-| `last` | float64 | yes | Last traded price; never a silent midpoint fallback |
-| `volume` | nullable integer | yes | Session volume when supplied |
-| `open_interest` | nullable integer | yes | Open interest when supplied |
-| `vendor_implied_volatility` | float64 | yes | Provider value, preserved separately |
-| `spot` | float64 | no* | Positive underlying reference for pricing |
-| `spot_timestamp` | timezone-aware datetime | no* | Observation time of `spot` |
-| `futures_price` | float64 | yes | Same-expiry reference when used to infer forward or `q` |
-| `futures_timestamp` | timezone-aware datetime | yes | Observation time of `futures_price` |
-| `risk_free_rate` | float64 | no* | Annual continuously compounded decimal |
-| `source` | string | no | Provider or origin |
-
-`no*` means required for model-ready output, although the normalized audit table
-may retain the row with a rejection reason when the value is unavailable.
-
-Provider-specific columns may be retained if their names and units are clear.
-They must not overwrite normalized or project-derived fields.
-
-## 4. Time and price conventions
-
-- Preserve original timestamp text and timezone metadata when available.
-- Store normalized instants as timezone-aware UTC values.
-- If expiry is supplied as a date only, record the assumed expiry time and
-  timezone. Without that assumption, `T` is not model-ready.
-- Use ACT/365F consistently:
+이 문서는 고정된 MarketData SPX option-chain snapshot을 BSM과 implied
+volatility 계산에 사용할 수 있는 데이터로 만드는 최소 계약을 정의한다.
 
 ```text
-T = max(expiry_timestamp - quote_timestamp, 0) / 365 calendar days
+raw snapshot → normalized rows → accepted / rejected → IV-ready rows
 ```
 
-A structurally valid two-sided quote requires finite values satisfying:
+## 1. 고정 분석 대상
 
-```text
-0 <= bid <= ask
-not (bid == 0 and ask == 0)
-```
+- Underlying: `SPX`
+- Provider: MarketData historical option chain
+- Quote date: `2026-07-15`
+- Requested DTE: `30`
+- Requested settlement filter: `am=false`, `pm=true`
+- Actual expiry in the snapshot: `2026-08-14T20:00:00Z`
+- Day count: ACT/365F
+- Default observed price: valid bid/ask midpoint
 
-For such quotes:
+요청 DTE는 검색 조건일 뿐이다. 실제 `T`는 provider의 quote와 expiry
+timestamp 차이로 다시 계산한다.
+
+## 2. 저장 규칙
+
+### `data/raw/marketdata_spx/`
+
+- API 응답을 처음 받은 형태로 저장한다.
+- 기존 nonempty raw 파일을 덮어쓰지 않는다.
+- 동일한 요청은 raw cache를 읽고 API를 다시 호출하지 않는다.
+
+### `data/interim/marketdata_spx/`
+
+- rejected rows와 `rejection_reason`을 저장한다.
+
+### `data/processed/marketdata_spx/`
+
+- accepted rows를 저장한다.
+- processed와 rejected 파일은 같은 raw snapshot에서 재생성할 수 있어야 한다.
+
+시장 CSV와 API token은 Git에 커밋하지 않는다.
+
+## 3. 최소 정규화 schema
+
+| Field | 의미 |
+| --- | --- |
+| `option_symbol` | provider contract identifier |
+| `underlying` | `SPX` |
+| `quote_timestamp` | UTC-aware quote time |
+| `expiry_timestamp` | UTC-aware expiry time |
+| `option_type` | `call` 또는 `put` |
+| `strike` | 양의 index-point strike |
+| `bid`, `ask` | two-sided quote |
+| `last` | 참고값; midpoint 대체 금지 |
+| `volume`, `open_interest` | 유동성 참고값 |
+| `spot` | provider underlying reference |
+| `vendor_iv` | provider 참고값; 자체 IV와 분리 |
+
+파생 필드는 다음과 같다.
 
 ```text
 mid = (bid + ask) / 2
 spread = ask - bid
-relative_spread = spread / mid, when mid > 0
+relative_spread = spread / mid
+T = (expiry_timestamp - quote_timestamp) / 365 days
+spot_moneyness = strike / spot
+log_spot_moneyness = log(strike / spot)
 ```
 
-The initial model-ready policy uses `mid` as `target_price` and requires
-`bid > 0`. Zero-bid rows are preserved but rejected or flagged explicitly.
-`last` may be analyzed separately but must never be substituted silently.
+## 4. Accepted와 rejected
 
-## 5. Derived and model-ready fields
+Accepted row는 최소한 다음을 만족해야 한다.
 
-Normalization or validation may derive:
+- 필수 identifier, price와 timestamp가 존재하고 finite다.
+- `option_type`이 `call` 또는 `put`이다.
+- `strike > 0`, `spot > 0`, `T > 0`이다.
+- `bid > 0`, `ask >= bid`, `mid > 0`이다.
+- `option_symbol`이 snapshot 안에서 중복되지 않는다.
 
-- `mid`, `spread`, and `relative_spread`;
-- `T` in years;
-- `forward` and `implied_q` when the spot, same-expiry futures, rate, and timing
-  convention are documented;
-- `log_forward_moneyness = log(strike / forward)`;
-- European no-arbitrage lower and upper bounds;
-- `target_price`;
-- `quality_flags`;
-- `rejection_reasons`;
-- project-computed `model_implied_volatility`, solver status, and repricing
-  error.
-
-The minimum fields passed to a spot-form European pricing model are:
+Rejected row는 삭제하지 않고 하나 이상의 안정적인 reason code를 가진다.
 
 ```text
-spot, strike, T, risk_free_rate, dividend_yield,
-option_type, target_price
+MISSING_REQUIRED_FIELD:<column>
+NON_NUMERIC_REQUIRED_FIELD:<column>
+NONFINITE_REQUIRED_FIELD:<column>
+INVALID_TIMESTAMP:<column>
+INVALID_OPTION_TYPE
+NONPOSITIVE_STRIKE
+NONPOSITIVE_SPOT
+NONPOSITIVE_BID
+CROSSED_QUOTE
+NONPOSITIVE_MID
+NONPOSITIVE_TTM
+DUPLICATE_OPTION_SYMBOL
 ```
 
-A documented forward-form convention may replace `spot` and `dividend_yield`.
-The convention must be consistent across pricing, implied-volatility inversion,
-and reporting.
+`volume == 0`, `open_interest == 0`, wide spread와 moneyness 범위는 row-level
+오류가 아니라 분석용 quality filter다.
 
-## 6. Validation and failure policy
+## 5. IV-ready fields
 
-Validation is separated into three levels.
+IV 계산 전에 다음 값을 명시적으로 추가한다.
 
-### Dataset-level errors
+| Field | 규칙 |
+| --- | --- |
+| `risk_free_rate` | 연속복리 연율 소수; 출처 기록 |
+| `dividend_yield` | 연속복리 연율 소수; 출처 기록 |
+| `target_price` | `mid` |
+| `forward` | `spot * exp((r - q) * T)` |
+| `log_forward_moneyness` | `log(strike / forward)` |
 
-Fail the pipeline when the file cannot be parsed, required columns cannot be
-mapped, snapshot metadata is absent, or units cannot be determined.
+IV 결과는 최소한 다음 열을 가진다.
 
-### Row-level rejection
+```text
+implied_volatility
+iv_status
+iv_failure_reason
+repricing_error
+```
 
-Retain rejected rows and attach one or more stable reason codes, including:
+`0.85 <= strike / forward <= 1.15`와 liquidity threshold는 연구 표본 선택
+조건이며 raw/accepted 여부를 바꾸지 않는다.
 
-- `MISSING_REQUIRED_FIELD`;
-- `INVALID_TIMESTAMP` or `UNKNOWN_EXPIRY_TIME`;
-- `INVALID_OPTION_TYPE`;
-- `NONPOSITIVE_STRIKE` or `NONPOSITIVE_SPOT`;
-- `MISSING_BID_ASK`, `NEGATIVE_QUOTE`, `CROSSED_QUOTE`, or `ZERO_QUOTE`;
-- `NONPOSITIVE_BID` under the initial model-ready policy;
-- `NONPOSITIVE_TTM`;
-- `DUPLICATE_CONTRACT_QUOTE`;
-- `PRICE_OUTSIDE_ARBITRAGE_BOUNDS`.
+## 6. 무차익 검증
 
-No rejected row may disappear without a reason code. A row may have multiple
-reasons.
+IV inversion 전에 `docs/model_contracts.md`의 European call/put bounds를
+확인한다. 범위 밖 가격을 clipping하지 않고 실패로 기록한다.
 
-### Quality and research flags
+## 7. 재현성
 
-Wide spread, low volume or open interest, observation-time mismatch, selected
-expiry, and moneyness range are quality or research filters. Their thresholds
-belong in configuration or the analysis notebook, not in this universal
-contract.
+최종 결과는 다음 정보와 연결한다.
 
-Normalization functions must not mutate the raw input DataFrame unless the
-function signature explicitly documents mutation.
+- raw filename과 request parameters
+- quote와 expiry timestamp
+- `r`, `q`의 값과 출처
+- filter와 `sigma_ATM` 선택 규칙
+- code commit
 
-## 7. Provenance and reproducibility
-
-Accepted and rejected outputs must remain traceable to:
-
-- `snapshot_id`, source file, and checksum;
-- provider and acquisition/export time;
-- quote, spot, and futures observation times;
-- field mapping and transformation configuration;
-- rate, dividend, forward, expiry-time, and day-count assumptions;
-- code commit and dependency version when practical.
-
-Historical results must not depend only on a provider's current live response.
-Use a permitted immutable snapshot or a small redistributable fixture.
-
-## 8. Required tests
-
-Unit tests must not call live APIs. Small synthetic fixtures must cover:
-
-- valid, missing, negative, crossed, zero-bid, and all-zero quotes;
-- duplicate contract quotes;
-- valid and invalid option-type mappings;
-- timezone conversion, date-only expiry, and ACT/365F;
-- nonpositive `spot`, `strike`, and `T`;
-- raw-input immutability;
-- accepted/rejected separation and 100% reason-code accounting.
-
-Provider field names, exact expiry-time handling, contract multiplier,
-settlement details, and redistribution constraints remain provisional until the
-first real KOSPI 200 snapshot audit. Record the accepted provider decision in
-`docs/decisions.md` when those items are fixed.
+Unit tests는 live API를 호출하지 않고 synthetic response와 임시 경로를
+사용한다.
