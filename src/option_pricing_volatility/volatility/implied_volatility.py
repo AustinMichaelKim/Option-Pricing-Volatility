@@ -9,6 +9,13 @@ from numbers import Integral, Real
 from option_pricing_volatility.models.bsm import bsm_price
 
 
+"""
+변동성 계산 이분법 알고리즘의 결과 객체.
+1. tolerance 1e-12 보다 작아 수렴할때의 변동성
+2. repricing_error: 시장 가격과 BSM 가격의 차이
+3. iterations: 수렴할때까지 반복한 횟수
+4. converged: 수렴 여부
+"""
 @dataclass(frozen=True, slots=True)
 class ImpliedVolatilityResult:
     """A converged BSM implied-volatility estimate and its diagnostics."""
@@ -19,6 +26,10 @@ class ImpliedVolatilityResult:
     converged: bool
 
 
+"""
+변동성 계산 핵심 함수.
+[volatilit_lower, volatility_upper] 구간에서 이분법으로 implied volatility를 계산한다.  [1e-8, 5.0] 구간이 기본값이다.
+"""
 def implied_volatility(
     spot: float,
     strike: float,
@@ -30,7 +41,7 @@ def implied_volatility(
     *,
     volatility_lower: float = 1e-8,
     volatility_upper: float = 5.0,
-    price_tolerance: float = 1e-8,
+    price_tolerance: float = 1e-8,  # 시장가격과 BSM가격이 이값보다 작으면 변동성 =0 으로 간주.
     volatility_tolerance: float = 1e-12,
     max_iterations: int = 200,
 ) -> ImpliedVolatilityResult:
@@ -51,6 +62,9 @@ def implied_volatility(
     market price.
     """
 
+    """
+    함수 입력값 유효성 검사. 기존의 모듈 함수들과 동일함.
+    """
     numeric_inputs = {
         "spot": spot,
         "strike": strike,
@@ -94,6 +108,9 @@ def implied_volatility(
     ):
         raise ValueError("max_iterations must be an integer greater than or equal to 1")
 
+    """
+    입력값 데이터 형변환. 추후 계산 과정에서 float형으로 계산하기 위해서.
+    """
     spot = float(spot)
     strike = float(strike)
     maturity = float(maturity)
@@ -106,6 +123,12 @@ def implied_volatility(
     volatility_tolerance = float(volatility_tolerance)
     max_iterations = int(max_iterations)
 
+
+    """
+    먼저 시장 가격이 무차익 범위 내에 존재하는지 확인한다. ( lower and upper bound of Call and Put options).
+    즉, 시장가격이 이론에서 제시하는 상한 하한을 넘어가면 에러를 발생시킨다.
+    => 에러가 뜬 경우에는 함수의 입력값 세팅이 잘못되었을 수 있음. 
+    """
     try:
         discounted_spot = spot * math.exp(-dividend_yield * maturity)
         discounted_strike = strike * math.exp(-rate * maturity)
@@ -128,6 +151,11 @@ def implied_volatility(
             f"got {market_price}"
         )
 
+
+    """
+    이분법 알고리즘을 통한 volatility의 계산.
+    1. 먼저 volatility = 0 인 경우의 BSM 가격을 계산한다. ( bsm_price에 volatility = 0.0 으로 입력 )  만약  시장가 - BSM(iv=0) < 10^-8이면  iv=0 리턴.
+    """
     zero_price = bsm_price(
         spot,
         strike,
@@ -146,6 +174,10 @@ def implied_volatility(
             converged=True,
         )
 
+    """
+    2. 함수에 입력한 bracket [volatility_lower, volatility_upper] 에서 BSM 가격을 계산한다. 
+        - 만약, braket 양끝에서의 bsm 가격이 OverflowError가 발생한다는 것은, float형으로 계산할 수 없는 값이 나왔다는 것이므로, bracket을 조정해야 한다.
+    """
     try:
         lower_price = bsm_price(
             spot,
@@ -169,6 +201,12 @@ def implied_volatility(
         raise ValueError(
             "volatility bracket must produce finite BSM endpoint prices"
         ) from exc
+
+    """
+    3. 시장가격과, bracket 양 끝 bsm 가격을 비교한다.  
+        - lower_price < market_price < upper_price  인 경우만 해당 알고리즘이 유효하다.  ( bracket iv 는 lower은 1e-8, upper는 5.0으로 설정되어 있음 )
+        - 시장가가 이 범위를 벗어나면, 이분법 알고리즘이 유효하지 않으므로, ValueError를 발생시킨다.
+    """
     lower_error = lower_price - market_price
     upper_error = upper_price - market_price
 
@@ -179,6 +217,11 @@ def implied_volatility(
             f"[{lower_price}, {upper_price}], got {market_price}"
         )
 
+    """
+    4. bracket 양 끝 bsm 가격과,  그 사이에 있는 market price를 비교한다.
+        - 만약, lower_error or upper_error 가 10^-8 보다 작다 ==  market price가 양 끝 bsm 가격과 거의 같다는 말.
+        - 따라서, volatility를 리턴하고 종료한다.
+    """
     if abs(lower_error) <= price_tolerance:
         return ImpliedVolatilityResult(
             volatility=volatility_lower,
@@ -194,10 +237,24 @@ def implied_volatility(
             converged=True,
         )
 
+    """
+    5. 4번을 통과한 것은,  market price가 bracket 양 끝 bsm 가격과 충분히 떨어져 있다는 의미.
+        - 따라서, bracket 양 끝을 기준으로 이분법 알고리즘을 수행한다
+    """
     lower = volatility_lower
     upper = volatility_upper
     latest_error = lower_error
 
+    """
+    이분법 알고리즘 수행
+        1. bracket의 중간값 volatility에 대해서 bsm 가격을 계산한다.
+        2. market price와 비교한다.
+            - | midpoint_bsm_price  -  market_price | < 1e-8 => 수렴. midpoint_volatility 리턴
+            
+            - lower_price < market_price < midpoint_price  =>  new braket [lower_volatility, midpoint_volatility]
+
+            - midpoint_price <  market_price < upper_price =>  new braket [midpoint_volatility, upper_volatility]
+    """
     for iteration in range(1, max_iterations + 1):
         midpoint = 0.5 * (lower + upper)
         midpoint_price = bsm_price(
@@ -211,6 +268,7 @@ def implied_volatility(
         )
         latest_error = midpoint_price - market_price
 
+        # 중간 변동성에서 구한 bsm가격이 시장가와 거의 유사한경우
         if abs(latest_error) <= price_tolerance:
             return ImpliedVolatilityResult(
                 volatility=midpoint,
@@ -219,11 +277,17 @@ def implied_volatility(
                 converged=True,
             )
 
+        # 중간 변동성 bsm 가격이 시장가보다 더 크다 => 상한을 mid로 재설정
+        # 중간 변동성 bsm 가격이 시장가보다 더 작다 => 하한을 mid로 재설정
         if latest_error > 0.0:
             upper = midpoint
         else:
             lower = midpoint
 
+        """
+        6. 새로운 volatility 구간을 잡았는데,  그 구간의 차이가 1e-12라면, 그냥 그 값을 변동성으로 계산한다. 
+            - [1.000000000.. , 1.000000000..] =>  그냥 변동성을 1.0000000.. 으로 간주.
+        """
         if upper - lower <= volatility_tolerance:
             estimate = 0.5 * (lower + upper)
             estimate_price = bsm_price(
@@ -242,6 +306,10 @@ def implied_volatility(
                 converged=True,
             )
 
+    """
+    최대 반복동안 수렴하지 않으면 반복문을 빠져나오고, 해당 런타임 에러가 실행된다.
+    이 경우, 반복수를 늘리거나, 아니면 brakcet 구간을 재설정한다.
+    """
     raise RuntimeError(
         "implied volatility did not converge within "
         f"{max_iterations} iterations; last absolute pricing error was "
