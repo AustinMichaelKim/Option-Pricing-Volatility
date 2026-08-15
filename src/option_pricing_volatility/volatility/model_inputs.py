@@ -10,6 +10,11 @@ import numpy as np
 import pandas as pd
 
 
+"""
+본 모듈에서는 주어진 옵션데이터와 무위험금리등의 정보를 통해서, 배당수익률과 forward 가격을 산출하는 함수를 구현한다.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class ForwardDividendEstimate:
     """One representative forward and implied continuous dividend yield."""
