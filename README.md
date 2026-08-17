@@ -22,7 +22,7 @@ Notebook은 실험과 해석에 사용하고, 재사용 계산은 Python package
 | CRR binomial pricing | 완료 |
 | Risk-neutral GBM과 Monte Carlo pricing | 완료 |
 | BSM closed-form pricing | 완료 |
-| Bisection implied-volatility solver | 다음 작업 |
+| Bisection implied-volatility solver | 완료 |
 | 네 개의 최종 그림과 보고서 | 예정 |
 
 ## 범위

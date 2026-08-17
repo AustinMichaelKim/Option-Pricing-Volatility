@@ -182,29 +182,7 @@ Do not silently:
 A successful result exposes the volatility, signed repricing error
 `BSM_price - target_price`, iteration count, and convergence status.
 
-## 7. Delta-hedging contract
-
-The initial hedging experiment uses one short European option unless a task
-states another position convention.
-
-A self-financing ledger must explicitly track:
-
-- option position and sign;
-- stock units held as the hedge;
-- cash account after establishing or rebalancing the hedge;
-- cash accrual at the continuously compounded risk-free rate;
-- dividends or dividend yield treatment;
-- transaction timing;
-- terminal option settlement and stock liquidation.
-
-Initial experiments assume zero transaction costs. This is a model assumption,
-not a statement about real markets.
-
-Rebalancing occurs on a documented time grid. Hedging P&L must state whether it
-is measured from the option writer's or buyer's perspective and whether the
-initial option premium is included.
-
-## 8. Numerical behavior
+## 7. Numerical behavior
 
 - Invalid financial domains raise informative exceptions.
 - Vectorization behavior must be documented rather than accidental.
