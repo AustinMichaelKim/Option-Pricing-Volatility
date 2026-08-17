@@ -1,5 +1,7 @@
 # Option Pricing and Volatility Analysis
 
+Notion page : https://slime-colony-47f.notion.site/Option-Pricing-and-Volatility-Analysis-38b2123be49080ca91afe7939b42df81?source=copy_link
+
 Hull 교재에서 이론적 기반을 마련합니다.  CRR, Black–Scholes–Merton, GBM Monte Carlo와 implied volatility를 코드로 구현합니다. 실제 SPX option 시장 데이터를 API로 받아와서 핵심 질문들에 대답하고, 결과 데이터를 시각화 합니다.
 
 Hull 교재 독해 및 필기노트 정리사항은 Notion: Introduction to Financial Engineering  에 저장해 놓았습니다.
